@@ -11,7 +11,7 @@ library(performance)
 
 # =========== 1 Data Import ==============
 
-vaccine <- read_csv(here("data", "vaccine_clean_final.csv"))
+vaccine <- read_csv(here("data/analytical", "vaccine_clean_final.csv"))
 glimpse(vaccine)
 summary(vaccine)
 
