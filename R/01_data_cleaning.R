@@ -4,6 +4,7 @@ library(tidyverse)
 library(naniar)
 library(knitr)
 library(kableExtra)
+library(here)
 
 
 # 1 Import Data
@@ -310,7 +311,7 @@ ggplot(state_summary,
 
 # 11 Export Final Dataset
 
-write_csv(df,"vaccine_clean_final.csv")
+write_csv(df, here("data", "analytical", "vaccine_clean_final.csv"))
 
 cat("\nFinal dataset rows:",nrow(df))
 cat("\nFinal dataset columns:",ncol(df))
