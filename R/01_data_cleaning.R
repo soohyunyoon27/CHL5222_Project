@@ -8,7 +8,7 @@ library(here)
 
 
 # 1 Import Data
-df_raw <- read_csv("vaccine.csv")
+df_raw <- read_csv("data/original/vaccine.csv")
 glimpse(df_raw)
 summary(df_raw)
 
