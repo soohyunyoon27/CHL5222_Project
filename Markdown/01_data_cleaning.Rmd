@@ -1,0 +1,993 @@
+---
+title: "CHL5222 Final Project"
+subtitle: "Data Cleaning, Missing Value Analysis, and Exploratory Data Analysis"
+author: "Xinyi Chen"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# 1. Load Packages
+
+```{r load-packages}
+library(tidyverse)
+library(naniar)
+library(mice)
+library(forcats)
+library(knitr)
+library(ggrepel)
+```
+
+# 2. Import Data
+
+```{r import-data}
+df_raw <- read_csv(here("data/original", "vaccine.csv"))
+```
+
+A brief inspection of the data structure is shown below.
+
+```{r raw-data-check}
+glimpse(df_raw)
+summary(df_raw)
+```
+
+# 3. Data Cleaning and Deduplication
+
+The first step is to standardize missing value indicators and remove invalid numeric codes. Specifically, `"null"` and blank strings are converted to `NA` for selected categorical variables, and `-1` is treated as missing for the vaccination outcome variables.
+
+```{r data-cleaning}
+df <- df_raw %>%
+  mutate(
+    across(c(year, city, county, type), ~ na_if(.x, "null")),
+    across(c(year, city, county, type), ~ na_if(.x, "")),
+    mmr = na_if(mmr, -1),
+    overall = na_if(overall, -1)
+  )
+```
+
+Exact duplicate rows are then removed.
+
+```{r exact-duplicates}
+df_nodup_exact <- df %>%
+  distinct()
+```
+
+To resolve remaining duplicate school-year-location records, the row with the largest enrollment is retained. If enrollment is tied, preference is given to the row with more non-missing outcome information.
+
+```{r deduplicate-records}
+df_dedup <- df_nodup_exact %>%
+  mutate(
+    outcome_nonmissing = rowSums(!is.na(select(., mmr, overall)))
+  ) %>%
+  group_by(state, name, year, type, city, county) %>%
+  arrange(desc(enroll), desc(outcome_nonmissing), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-outcome_nonmissing)
+
+df <- df_dedup
+df_missing <- df
+```
+
+The table below summarizes the dataset size across the cleaning steps.
+
+```{r cleaning-summary}
+tibble(
+  Step = c(
+    "Raw dataset",
+    "After removing exact duplicate rows",
+    "After deduplication"
+  ),
+  Rows = c(
+    nrow(df_raw),
+    nrow(df_nodup_exact),
+    nrow(df_dedup)
+  )
+) %>%
+  knitr::kable(
+    caption = "Dataset Size Across Cleaning Steps",
+    align = c("l", "r")
+  )
+```
+
+# 4. Descriptive Statistics by Reporting Status
+
+To understand how the analytic sample differs by reporting pattern, schools are classified into three retained groups: those reporting both MMR and overall vaccination rates, those reporting only MMR, and those reporting only overall vaccination rates. Schools missing both outcomes are excluded from this descriptive table.
+
+```{r descriptive-prep}
+df_summary_data <- df %>%
+  mutate(
+    reporting_group = case_when(
+      !is.na(mmr) & !is.na(overall) ~ "Overall and MMR",
+      !is.na(mmr) & is.na(overall) ~ "MMR Only",
+      is.na(mmr) & !is.na(overall) ~ "Overall Only",
+      TRUE ~ "Exclude"
+    ),
+    reporting_group = factor(
+      reporting_group,
+      levels = c("Overall and MMR", "MMR Only", "Overall Only", "Exclude")
+    ),
+    school_cat = case_when(
+      type == "Public" ~ "Public",
+      type == "Private" ~ "Private",
+      type %in% c("BOCES", "Charter", "Kindergarten", "Nonpublic") ~ "Other",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(reporting_group != "Exclude")
+
+get_stats <- function(df_in) {
+  u_states <- n_distinct(df_in$state)
+
+  sch_per_state <- df_in %>%
+    group_by(state) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    pull(n)
+
+  fmt_mean_sd <- function(x) {
+    if (length(na.omit(x)) < 1) return("0 (0)")
+    paste0(round(mean(x, na.rm = TRUE), 1), " (", round(sd(x, na.rm = TRUE), 1), ")")
+  }
+
+  tibble(
+    Variable = c(
+      "Unique States",
+      "Avg Schools per State",
+      "State Spending in 1000s (2016)",
+      "Total Number of Schools (n)",
+      "Enrollment per School",
+      "Public Schools (n)",
+      "Private Schools (n)",
+      "Other Schools (n)"
+    ),
+    Value = c(
+      as.character(u_states),
+      fmt_mean_sd(sch_per_state),
+      fmt_mean_sd(df_in$statespending2016),
+      as.character(nrow(df_in)),
+      fmt_mean_sd(df_in$enroll),
+      as.character(sum(df_in$school_cat == "Public", na.rm = TRUE)),
+      as.character(sum(df_in$school_cat == "Private", na.rm = TRUE)),
+      as.character(sum(df_in$school_cat == "Other", na.rm = TRUE))
+    )
+  )
+}
+
+total_col <- get_stats(df_summary_data) %>% rename(`Full Sample` = Value)
+
+group_cols <- df_summary_data %>%
+  group_split(reporting_group) %>%
+  map(~{
+    g_name <- as.character(unique(.x$reporting_group))
+    get_stats(.x) %>% rename(!!g_name := Value)
+  }) %>%
+  reduce(left_join, by = "Variable")
+
+table1 <- total_col %>%
+  left_join(group_cols, by = "Variable")
+```
+
+```{r table1}
+knitr::kable(
+  table1,
+  caption = "Table 1. Descriptive Statistics by Vaccination Reporting Status",
+  align = c("l", "r", "r", "r", "r")
+)
+```
+
+# 5. Missing Value Analysis
+
+Before recoding categorical missing values to an explicit `"Unknown"` level, the original cleaned dataset is used to quantify missingness. This preserves the true extent of missing data.
+
+```{r convert-types-missing}
+df_missing <- df_missing %>%
+  mutate(
+    state = as.factor(state),
+    year = as.factor(year),
+    type = as.factor(type),
+    city = as.factor(city),
+    county = as.factor(county)
+  )
+
+missing_table <- tibble(
+  variable = names(df_missing),
+  missing_n = colSums(is.na(df_missing)),
+  missing_pct = round(colMeans(is.na(df_missing)) * 100, 2)
+) %>%
+  arrange(desc(missing_n))
+```
+
+The table below summarizes the number and percentage of missing values for each variable.
+
+```{r missing-table}
+knitr::kable(
+  missing_table,
+  caption = "Missing Value Summary",
+  align = c("l", "r", "r")
+)
+```
+
+The following figure provides a visual summary of missingness across variables.
+
+```{r missing-plot}
+ggplot(missing_table,
+       aes(x = missing_n, y = reorder(variable, missing_n))) +
+  geom_point(size = 3) +
+  geom_segment(aes(x = 0, xend = missing_n, y = variable, yend = variable)) +
+  geom_text(
+    aes(label = paste0(missing_n, " (", missing_pct, "%)")),
+    hjust = -0.1,
+    size = 3
+  ) +
+  labs(
+    title = "Number of Missing Values by Variable",
+    x = "Missing Count",
+    y = "Variable"
+  ) +
+  theme_minimal() +
+  expand_limits(x = max(missing_table$missing_n) * 1.15)
+```
+
+# 6. Missingness by State and School Type
+
+Because missingness may not be random across strata, it is useful to examine whether missing MMR and overall vaccination rates vary by state and school type.
+
+```{r missing-patterns}
+mmr_missing_state <- df_missing %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    mmr_missing = sum(is.na(mmr)),
+    mmr_missing_pct = mean(is.na(mmr)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mmr_missing_pct))
+
+overall_missing_state <- df_missing %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    overall_missing = sum(is.na(overall)),
+    overall_missing_pct = mean(is.na(overall)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(overall_missing_pct))
+
+mmr_missing_type <- df_missing %>%
+  group_by(type) %>%
+  summarise(
+    schools = n(),
+    mmr_missing = sum(is.na(mmr)),
+    mmr_missing_pct = mean(is.na(mmr)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mmr_missing_pct))
+
+overall_missing_type <- df_missing %>%
+  group_by(type) %>%
+  summarise(
+    schools = n(),
+    overall_missing = sum(is.na(overall)),
+    overall_missing_pct = mean(is.na(overall)) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(overall_missing_pct))
+```
+
+## 6.1 Missing MMR by State
+
+```{r plot-mmr-missing-state}
+ggplot(mmr_missing_state,
+       aes(x = reorder(state, mmr_missing_pct), y = mmr_missing_pct)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  geom_text(
+    aes(label = paste0(mmr_missing, " (", round(mmr_missing_pct, 1), "%)")),
+    hjust = -0.1,
+    size = 3
+  ) +
+  labs(
+    title = "Percentage of Missing MMR by State",
+    subtitle = paste("n =", sum(mmr_missing_state$schools), "schools"),
+    x = "State",
+    y = "Missing MMR (%)"
+  ) +
+  theme_minimal() +
+  expand_limits(y = max(mmr_missing_state$mmr_missing_pct) * 1.1)
+```
+
+## 6.2 Missing Overall by State
+
+```{r plot-overall-missing-state}
+ggplot(overall_missing_state,
+       aes(x = reorder(state, overall_missing_pct), y = overall_missing_pct)) +
+  geom_col(fill = "gray40") +
+  coord_flip() +
+  geom_text(
+    aes(label = paste0(overall_missing, " (", round(overall_missing_pct, 1), "%)")),
+    hjust = -0.1,
+    size = 3
+  ) +
+  labs(
+    title = "Percentage of Missing Overall Vaccination Rate by State",
+    subtitle = paste("n =", sum(overall_missing_state$schools), "schools"),
+    x = "State",
+    y = "Missing Overall (%)"
+  ) +
+  theme_minimal() +
+  expand_limits(y = max(overall_missing_state$overall_missing_pct) * 1.1)
+```
+
+## 6.3 Missing MMR by School Type
+
+```{r plot-mmr-missing-type}
+ggplot(mmr_missing_type,
+       aes(x = reorder(type, mmr_missing_pct), y = mmr_missing_pct)) +
+  geom_col(fill = "steelblue") +
+  geom_text(
+    aes(label = paste0(mmr_missing, " (", round(mmr_missing_pct, 1), "%)")),
+    vjust = -0.3,
+    size = 3
+  ) +
+  labs(
+    title = "Percentage of Missing MMR by School Type",
+    subtitle = paste("n =", sum(mmr_missing_type$schools), "schools"),
+    x = "School Type",
+    y = "Missing MMR (%)"
+  ) +
+  theme_minimal()
+```
+
+## 6.4 Missing Overall by School Type
+
+```{r plot-overall-missing-type}
+ggplot(overall_missing_type,
+       aes(x = reorder(type, overall_missing_pct), y = overall_missing_pct)) +
+  geom_col(fill = "gray40") +
+  geom_text(
+    aes(label = paste0(overall_missing, " (", round(overall_missing_pct, 1), "%)")),
+    vjust = -0.3,
+    size = 3
+  ) +
+  labs(
+    title = "Percentage of Missing Overall Vaccination Rate by School Type",
+    subtitle = paste("n =", sum(overall_missing_type$schools), "schools"),
+    x = "School Type",
+    y = "Missing Overall (%)"
+  ) +
+  theme_minimal()
+```
+
+# 7. Reporting Pattern Summary
+
+After the original missingness assessment is completed, categorical missing values are recoded to an explicit `"Unknown"` level so that subsequent analyses can retain those observations.
+
+```{r create-analysis-ready-data}
+df <- df_missing %>%
+  mutate(
+    state = as.factor(state),
+    year = fct_explicit_na(as.factor(year), na_level = "Unknown"),
+    type = fct_explicit_na(as.factor(type), na_level = "Unknown"),
+    city = fct_explicit_na(as.factor(city), na_level = "Unknown"),
+    county = fct_explicit_na(as.factor(county), na_level = "Unknown")
+  )
+
+report_type_summary <- df %>%
+  summarise(
+    both = sum(!is.na(mmr) & !is.na(overall)),
+    mmr_only = sum(!is.na(mmr) & is.na(overall)),
+    overall_only = sum(is.na(mmr) & !is.na(overall)),
+    none = sum(is.na(mmr) & is.na(overall))
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "report_type",
+    values_to = "schools"
+  ) %>%
+  mutate(
+    pct = round(schools / sum(schools) * 100, 2)
+  )
+```
+
+```{r report-type-table}
+knitr::kable(
+  report_type_summary,
+  caption = "Reporting Pattern Summary",
+  align = c("l", "r", "r")
+)
+```
+
+```{r report-type-plot}
+ggplot(report_type_summary, aes(x = report_type, y = schools)) +
+  geom_col(fill = "tomato") +
+  geom_text(
+    aes(label = paste0(schools, " (", pct, "%)")),
+    vjust = -0.3,
+    size = 4
+  ) +
+  labs(
+    title = "Distribution of Vaccination Reporting Pattern",
+    subtitle = paste("n =", sum(report_type_summary$schools), "schools"),
+    x = "Reporting Pattern",
+    y = "Number of Schools"
+  ) +
+  theme_minimal()
+```
+
+# 8. Multiple Imputation
+
+To support exploratory analyses on a more complete dataset, multiple imputation is performed for `enroll`, `mmr`, and `overall` using the CART method in `mice`. State education spending is used as a predictor, and school type is retained as a non-imputed categorical variable.
+
+```{r imputation, cache=TRUE}
+mice_data <- df %>%
+  select(type, enroll, mmr, overall, statespending2016)
+
+mice_data$type <- as.factor(mice_data$type)
+
+meth <- make.method(mice_data)
+meth["type"] <- ""
+meth["enroll"] <- "cart"
+meth["mmr"] <- "cart"
+meth["overall"] <- "cart"
+meth["statespending2016"] <- ""
+
+pred <- matrix(0, nrow = ncol(mice_data), ncol = ncol(mice_data))
+colnames(pred) <- names(mice_data)
+rownames(pred) <- names(mice_data)
+
+pred["enroll", "statespending2016"] <- 1
+pred["mmr", c("enroll", "statespending2016")] <- 1
+pred["overall", c("enroll", "statespending2016")] <- 1
+
+mice_fit <- mice(
+  mice_data,
+  m = 5,
+  method = meth,
+  predictorMatrix = pred,
+  seed = 123,
+  printFlag = TRUE
+)
+
+df_mice <- complete(mice_fit, 1)
+
+df_imp <- df %>%
+  mutate(
+    enroll_imp = df_mice$enroll,
+    mmr_imp = df_mice$mmr,
+    overall_imp = df_mice$overall
+  )
+```
+
+The following table shows missingness before and after imputation for the imputed variables.
+
+```{r imputation-check}
+tibble(
+  variable = c("enroll", "mmr", "overall"),
+  original_missing = c(
+    sum(is.na(df$enroll)),
+    sum(is.na(df$mmr)),
+    sum(is.na(df$overall))
+  ),
+  imputed_missing = c(
+    sum(is.na(df_imp$enroll_imp)),
+    sum(is.na(df_imp$mmr_imp)),
+    sum(is.na(df_imp$overall_imp))
+  )
+) %>%
+  knitr::kable(
+    caption = "Missingness Before and After Imputation",
+    align = c("l", "r", "r")
+  )
+```
+
+# 9. Exploratory Data Analysis: Observed and Imputed Data
+
+To compare the observed and imputed datasets, subsets are created for observed MMR and overall vaccination rates, while the imputed dataset is used in full.
+
+```{r create-eda-subsets}
+df_mmr_obs <- df %>% filter(!is.na(mmr))
+df_overall_obs <- df %>% filter(!is.na(overall))
+
+df_mmr_imp <- df_imp
+df_overall_imp <- df_imp
+```
+
+## 9.1 Distribution of Vaccination Rates
+
+The first set of figures compares the marginal distributions of observed and imputed vaccination rates.
+
+```{r obs-mmr-hist}
+ggplot(df_mmr_obs, aes(x = mmr)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Observed MMR Vaccination Rates",
+    subtitle = paste("n =", nrow(df_mmr_obs)),
+    x = "MMR Vaccination Rate",
+    y = "Number of Schools"
+  ) +
+  theme_minimal()
+```
+
+```{r imp-mmr-hist}
+ggplot(df_mmr_imp, aes(x = mmr_imp)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Imputed MMR Vaccination Rates",
+    subtitle = paste("n =", nrow(df_mmr_imp)),
+    x = "MMR Vaccination Rate",
+    y = "Number of Schools"
+  ) +
+  theme_minimal()
+```
+
+```{r obs-overall-hist}
+ggplot(df_overall_obs, aes(x = overall)) +
+  geom_histogram(bins = 30, fill = "orange", color = "white") +
+  labs(
+    title = "Distribution of Observed Overall Vaccination Rates",
+    subtitle = paste("n =", nrow(df_overall_obs)),
+    x = "Overall Vaccination Rate",
+    y = "Number of Schools"
+  ) +
+  theme_minimal()
+```
+
+```{r imp-overall-hist}
+ggplot(df_overall_imp, aes(x = overall_imp)) +
+  geom_histogram(bins = 30, fill = "orange", color = "white") +
+  labs(
+    title = "Distribution of Imputed Overall Vaccination Rates",
+    subtitle = paste("n =", nrow(df_overall_imp)),
+    x = "Overall Vaccination Rate",
+    y = "Number of Schools"
+  ) +
+  theme_minimal()
+```
+
+## 9.2 Vaccination Rates by School Type
+
+Boxplots are used to compare vaccination rates across school types in the observed and imputed datasets.
+
+```{r obs-mmr-by-type}
+type_count_mmr_obs <- df_mmr_obs %>%
+  count(type) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    type_lab = paste0(type, "\n", n, " (", pct, "%)")
+  )
+
+ggplot(
+  df_mmr_obs %>% left_join(type_count_mmr_obs, by = "type"),
+  aes(x = type_lab, y = mmr)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Observed MMR Vaccination Rate by School Type",
+    subtitle = paste("n =", nrow(df_mmr_obs)),
+    x = "School Type",
+    y = "MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r imp-mmr-by-type}
+type_count_mmr_imp <- df_mmr_imp %>%
+  count(type) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    type_lab = paste0(type, "\n", n, " (", pct, "%)")
+  )
+
+ggplot(
+  df_mmr_imp %>% left_join(type_count_mmr_imp, by = "type"),
+  aes(x = type_lab, y = mmr_imp)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Imputed MMR Vaccination Rate by School Type",
+    subtitle = paste("n =", nrow(df_mmr_imp)),
+    x = "School Type",
+    y = "MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r obs-overall-by-type}
+type_count_overall_obs <- df_overall_obs %>%
+  count(type) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    type_lab = paste0(type, "\n", n, " (", pct, "%)")
+  )
+
+ggplot(
+  df_overall_obs %>% left_join(type_count_overall_obs, by = "type"),
+  aes(x = type_lab, y = overall)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Observed Overall Vaccination Rate by School Type",
+    subtitle = paste("n =", nrow(df_overall_obs)),
+    x = "School Type",
+    y = "Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r imp-overall-by-type}
+type_count_overall_imp <- df_overall_imp %>%
+  count(type) %>%
+  mutate(
+    pct = round(n / sum(n) * 100, 1),
+    type_lab = paste0(type, "\n", n, " (", pct, "%)")
+  )
+
+ggplot(
+  df_overall_imp %>% left_join(type_count_overall_imp, by = "type"),
+  aes(x = type_lab, y = overall_imp)
+) +
+  geom_boxplot() +
+  labs(
+    title = "Imputed Overall Vaccination Rate by School Type",
+    subtitle = paste("n =", nrow(df_overall_imp)),
+    x = "School Type",
+    y = "Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+## 9.3 Average Vaccination Rates by State
+
+State-level average vaccination rates are then compared for observed and imputed datasets.
+
+```{r state-summary-obs-imp}
+state_summary_mmr_obs <- df_mmr_obs %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    mean_mmr = mean(mmr, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+state_summary_overall_obs <- df_overall_obs %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    mean_overall = mean(overall, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+state_summary_mmr_imp <- df_mmr_imp %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    mean_mmr = mean(mmr_imp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+state_summary_overall_imp <- df_overall_imp %>%
+  group_by(state) %>%
+  summarise(
+    schools = n(),
+    mean_overall = mean(overall_imp, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r plot-state-mmr-obs}
+ggplot(state_summary_mmr_obs,
+       aes(x = reorder(state, mean_mmr), y = mean_mmr)) +
+  geom_col(fill = "darkblue") +
+  coord_flip() +
+  labs(
+    title = "Average Observed MMR Vaccination Rate by State",
+    subtitle = paste("n =", sum(state_summary_mmr_obs$schools), "schools"),
+    x = "State",
+    y = "Average MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-state-mmr-imp}
+ggplot(state_summary_mmr_imp,
+       aes(x = reorder(state, mean_mmr), y = mean_mmr)) +
+  geom_col(fill = "darkblue") +
+  coord_flip() +
+  labs(
+    title = "Average Imputed MMR Vaccination Rate by State",
+    subtitle = paste("n =", sum(state_summary_mmr_imp$schools), "schools"),
+    x = "State",
+    y = "Average MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-state-overall-obs}
+ggplot(state_summary_overall_obs,
+       aes(x = reorder(state, mean_overall), y = mean_overall)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Average Observed Overall Vaccination Rate by State",
+    subtitle = paste("n =", sum(state_summary_overall_obs$schools), "schools"),
+    x = "State",
+    y = "Average Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-state-overall-imp}
+ggplot(state_summary_overall_imp,
+       aes(x = reorder(state, mean_overall), y = mean_overall)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Average Imputed Overall Vaccination Rate by State",
+    subtitle = paste("n =", sum(state_summary_overall_imp$schools), "schools"),
+    x = "State",
+    y = "Average Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+# 10. State Education Spending and Vaccination Rates
+
+```{r spending-state-level}
+state_level <- df %>%
+  distinct(state, statespending2016)
+```
+
+```{r spending-hist}
+ggplot(state_level, aes(x = statespending2016)) +
+  geom_histogram(bins = 15, fill = "darkgreen", color = "white") +
+  scale_x_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "Distribution of State Education Spending",
+    subtitle = paste("n =", nrow(state_level), "states"),
+    x = "State Education Spending (2016, $ Millions)",
+    y = "Number of States"
+  ) +
+  theme_minimal()
+```
+
+```{r spending-association-data}
+state_spending_mmr_obs <- df_mmr_obs %>%
+  group_by(state, statespending2016) %>%
+  summarise(
+    schools = n(),
+    mean_mmr = mean(mmr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(schools, " schools"))
+
+state_spending_overall_obs <- df_overall_obs %>%
+  group_by(state, statespending2016) %>%
+  summarise(
+    schools = n(),
+    mean_overall = mean(overall, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(schools, " schools"))
+
+state_spending_mmr_imp <- df_mmr_imp %>%
+  group_by(state, statespending2016) %>%
+  summarise(
+    schools = n(),
+    mean_mmr = mean(mmr_imp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(schools, " schools"))
+
+state_spending_overall_imp <- df_overall_imp %>%
+  group_by(state, statespending2016) %>%
+  summarise(
+    schools = n(),
+    mean_overall = mean(overall_imp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(schools, " schools"))
+```
+
+## 10.1 Observed MMR vs State Spending
+
+```{r spending-mmr-obs}
+ggplot(state_spending_mmr_obs,
+       aes(x = statespending2016, y = mean_mmr)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 20) +
+  scale_x_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "State Education Spending and Average Observed MMR Vaccination Rate",
+    subtitle = paste("n =", nrow(state_spending_mmr_obs), "states"),
+    x = "State Education Spending (2016)",
+    y = "Average MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+## 10.2 Observed Overall vs State Spending
+
+```{r spending-overall-obs}
+ggplot(state_spending_overall_obs,
+       aes(x = statespending2016, y = mean_overall)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 20) +
+  scale_x_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "State Education Spending and Average Observed Overall Vaccination Rate",
+    subtitle = paste("n =", nrow(state_spending_overall_obs), "states"),
+    x = "State Education Spending (2016)",
+    y = "Average Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+## 10.3 Imputed MMR vs State Spending
+
+```{r spending-mmr-imp}
+ggplot(state_spending_mmr_imp,
+       aes(x = statespending2016, y = mean_mmr)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 20) +
+  scale_x_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "State Education Spending and Average Imputed MMR Vaccination Rate",
+    subtitle = paste("n =", nrow(state_spending_mmr_imp), "states"),
+    x = "State Education Spending (2016)",
+    y = "Average MMR Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+## 10.4 Imputed Overall vs State Spending
+
+```{r spending-overall-imp}
+ggplot(state_spending_overall_imp,
+       aes(x = statespending2016, y = mean_overall)) +
+  geom_point(size = 3, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = 20) +
+  scale_x_continuous(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  labs(
+    title = "State Education Spending and Average Imputed Overall Vaccination Rate",
+    subtitle = paste("n =", nrow(state_spending_overall_imp), "states"),
+    x = "State Education Spending (2016)",
+    y = "Average Overall Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+
+# 11. Observed vs Imputed Density Comparison
+
+Finally, density plots are used to compare observed and imputed distributions directly. These plots help assess whether the imputed values are broadly consistent with the shape of the observed data.
+
+## 11.1 MMR Distribution
+
+```{r density-mmr}
+df_plot_mmr <- bind_rows(
+  df %>%
+    filter(!is.na(mmr)) %>%
+    transmute(value = mmr, dataset = "Observed"),
+  df_imp %>%
+    filter(!is.na(mmr_imp)) %>%
+    transmute(value = mmr_imp, dataset = "Imputed")
+)
+
+ggplot(df_plot_mmr, aes(x = value, fill = dataset, color = dataset)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  coord_cartesian(xlim = c(80, 100)) +
+  labs(
+    title = "Observed vs Imputed MMR Distribution",
+    subtitle = paste(
+      "Observed n =", sum(!is.na(df$mmr)),
+      "| Imputed n =", sum(!is.na(df_imp$mmr_imp))
+    ),
+    x = "MMR Vaccination Rate",
+    y = "Density",
+    fill = "Dataset",
+    color = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+## 11.2 Overall Distribution
+
+```{r density-overall}
+df_plot_overall <- bind_rows(
+  df %>%
+    filter(!is.na(overall)) %>%
+    transmute(value = overall, dataset = "Observed"),
+  df_imp %>%
+    filter(!is.na(overall_imp)) %>%
+    transmute(value = overall_imp, dataset = "Imputed")
+)
+
+ggplot(df_plot_overall, aes(x = value, fill = dataset, color = dataset)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  coord_cartesian(xlim = c(80, 100)) +
+  labs(
+    title = "Observed vs Imputed Overall Distribution",
+    subtitle = paste(
+      "Observed n =", sum(!is.na(df$overall)),
+      "| Imputed n =", sum(!is.na(df_imp$overall_imp))
+    ),
+    x = "Overall Vaccination Rate",
+    y = "Density",
+    fill = "Dataset",
+    color = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+## 11.3 Enrollment Distribution
+
+```{r density-enroll}
+ df_plot_enroll <- bind_rows(
+  df %>%
+    filter(!is.na(enroll)) %>%
+    transmute(value = enroll, dataset = "Observed"),
+  df_imp %>%
+    filter(!is.na(enroll_imp)) %>%
+    transmute(value = enroll_imp, dataset = "Imputed")
+)
+
+ggplot(df_plot_enroll, aes(x = value, fill = dataset, color = dataset)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  labs(
+    title = "Observed vs Imputed Enrollment Distribution",
+    subtitle = paste(
+      "Observed n =", sum(!is.na(df$enroll)),
+      "| Imputed n =", sum(!is.na(df_imp$enroll_imp))
+    ),
+    x = "Enrollment",
+    y = "Density",
+    fill = "Dataset",
+    color = "Dataset"
+  ) +
+  theme_minimal()
+```
+
+# 12. Export Final Datasets
+
+The final observed and imputed datasets are exported for future use.
+
+```{r export-data}
+write_csv(df, here("data/analytical", "vaccine_clean_final.csv"))
+write_csv(df_imp, here("data/analytical", "vaccine_clean_imputed.csv"))
+
+tibble(
+  dataset = c("Final observed dataset", "Final imputed dataset"),
+  rows = c(nrow(df), nrow(df_imp)),
+  columns = c(ncol(df), ncol(df_imp))
+) %>%
+  knitr::kable(
+    caption = "Dimensions of Final Exported Datasets",
+    align = c("l", "r", "r")
+  )
+```
+
+# Conclusion
+
+In summary, the dataset was cleaned by standardizing missing value codes, removing exact duplicate rows, and resolving duplicate school-year-location records. Missingness was substantial in several variables and varied across states and school types, which supported the use of multiple imputation for exploratory purposes. The observed and imputed analyses allowed comparison of vaccination rate distributions and state-level patterns, while the state education spending analysis provided additional context for between-state variation. This cleaned and documented workflow provides a reproducible foundation for later modeling or inferential analyses.
