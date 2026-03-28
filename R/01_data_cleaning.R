@@ -7,7 +7,7 @@ library(ggrepel)
 
 
 # 2. Import Data
-df_raw <- read_csv("vaccine.csv")
+df_raw <- read_csv("data/original/vaccine.csv")
 
 glimpse(df_raw)
 summary(df_raw)
@@ -94,7 +94,6 @@ duplicate_after <- df_dedup %>%
 
 duplicate_after %>%
   print(caption = "Duplicate School-Year-Location Records After Cleaning") 
-
 
 df <- df_dedup
 df_missing <- df
@@ -787,9 +786,10 @@ ggplot() +
 
 # 18. Export Final Clean Datasets
 #deduplicated dataset without impute
-write_csv(df_missing, "vaccine_clean_final.csv")
+write_csv(df, here("data/analytical", "vaccine_clean_final.csv"))
 #final imputed dataset (used for analysis)
-write_csv(df_imp, "vaccine_clean_imputed.csv")
+write_csv(df_imp, here("data/analytical", "vaccine_clean_imputed.csv"))
+
 
 tibble(
   dataset = c( "Final imputed dataset"),
